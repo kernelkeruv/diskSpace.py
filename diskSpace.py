@@ -22,6 +22,12 @@ import time
 from datetime import datetime
 
 IS_WINDOWS = os.name == "nt"
+PSEUDO_FS_TYPES = {
+    "autofs", "binfmt_misc", "bpf", "cgroup", "cgroup2", "configfs", "debugfs",
+    "devpts", "devtmpfs", "fusectl", "hugetlbfs", "mqueue", "nsfs", "overlay",
+    "proc", "pstore", "ramfs", "rpc_pipefs", "securityfs", "selinuxfs", "sysfs",
+    "tmpfs", "tracefs",
+}
 
 # --------------------------- Formatting ---------------------------
 
@@ -58,9 +64,9 @@ def enumerate_disks():
             with open('/proc/mounts', 'r', errors='ignore') as f:
                 for line in f:
                     parts = line.split()
-                    if len(parts) >= 2:
-                        mnt = parts[1]
-                        mounts.append(mnt)
+                    if len(parts) >= 3:
+                        src, mnt, fstype = parts[0], parts[1], parts[2]
+                        mounts.append((src, mnt, fstype))
         except Exception:
             # macOS / BSD fallback
             import subprocess
@@ -69,21 +75,33 @@ def enumerate_disks():
                 for line in out.splitlines()[1:]:
                     cols = line.split()
                     if len(cols) >= 6:
-                        mounts.append(cols[-1])
+                        mounts.append((cols[0], cols[-1], "unknown"))
             except Exception:
-                mounts = ['/']
+                mounts = [('/', '/', 'unknown')]
         # Filter likely real mounts
-        seen = set()
-        for mnt in mounts:
+        seen_paths = set()
+        seen_devices = set()
+        for src, mnt, fstype in mounts:
             if not os.path.isdir(mnt):
                 continue
+            if fstype in PSEUDO_FS_TYPES:
+                continue
+            # Skip kernel pseudo mounts that can appear as binds on Linux.
             if any(mnt.startswith(p) for p in ('/proc','/sys','/dev','/run','/snap','/private/var')):
                 continue
-            if mnt in seen:
+            if mnt in seen_paths:
                 continue
-            seen.add(mnt)
             try:
+                st = os.stat(mnt)
                 total, used, free = shutil.disk_usage(mnt)
+                if total <= 0:
+                    continue
+                # Avoid duplicate entries from bind/alias mounts of same device.
+                dev_key = st.st_dev
+                if dev_key in seen_devices:
+                    continue
+                seen_devices.add(dev_key)
+                seen_paths.add(mnt)
                 disks.append((mnt, mnt, total, free))
             except Exception:
                 continue
@@ -94,11 +112,27 @@ def enumerate_disks():
 # --------------------------- Scanning ---------------------------
 
 def iter_files(root: str):
-    for dp, dn, fn in os.walk(root, onerror=lambda e: None):
+    try:
+        root_dev = os.stat(root).st_dev
+    except Exception:
+        root_dev = None
+    for dp, dn, fn in os.walk(root, topdown=True, onerror=lambda e: None):
+        if root_dev is not None:
+            same_fs_dirs = []
+            for d in dn:
+                sub = os.path.join(dp, d)
+                try:
+                    if os.lstat(sub).st_dev == root_dev:
+                        same_fs_dirs.append(d)
+                except Exception:
+                    continue
+            dn[:] = same_fs_dirs
         for f in fn:
             fp = os.path.join(dp, f)
             try:
                 st = os.stat(fp, follow_symlinks=False)
+                if root_dev is not None and st.st_dev != root_dev:
+                    continue
                 yield fp, st.st_size, st.st_mtime
             except Exception:
                 continue
@@ -115,12 +149,26 @@ def top_files(root: str, n: int):
     heap.sort(reverse=True)
     return heap  # list[(size, path, mtime)] largest first
 
-def folder_size(folder: str) -> int:
+def folder_size(folder: str, root_dev: int = None) -> int:
     total = 0
-    for dp, dn, fn in os.walk(folder, onerror=lambda e: None):
+    for dp, dn, fn in os.walk(folder, topdown=True, onerror=lambda e: None):
+        if root_dev is not None:
+            same_fs_dirs = []
+            for d in dn:
+                sub = os.path.join(dp, d)
+                try:
+                    if os.lstat(sub).st_dev == root_dev:
+                        same_fs_dirs.append(d)
+                except Exception:
+                    continue
+            dn[:] = same_fs_dirs
         for f in fn:
             try:
-                total += os.path.getsize(os.path.join(dp, f))
+                fp = os.path.join(dp, f)
+                st = os.stat(fp, follow_symlinks=False)
+                if root_dev is not None and st.st_dev != root_dev:
+                    continue
+                total += st.st_size
             except Exception:
                 continue
     return total
@@ -128,11 +176,18 @@ def folder_size(folder: str) -> int:
 def top_folders(root: str, n: int):
     entries = []  # (size, path, mtime)
     try:
+        root_dev = os.stat(root).st_dev
+    except Exception:
+        root_dev = None
+    try:
         with os.scandir(root) as it:
             for e in it:
                 if e.is_dir(follow_symlinks=False):
                     try:
-                        sz = folder_size(e.path)
+                        est = e.stat(follow_symlinks=False)
+                        if root_dev is not None and est.st_dev != root_dev:
+                            continue
+                        sz = folder_size(e.path, root_dev=root_dev)
                         mtime = e.stat(follow_symlinks=False).st_mtime
                         entries.append((sz, e.path, mtime))
                     except Exception:

@@ -13,6 +13,7 @@ A cross-platform Python 3 script to list the **largest files and folders** on on
 * Optional: export results as CSV files in `~/Downloads`
 * Uses only Python built-in modules (`os`, `csv`, `heapq`, `shutil`, etc.)
 * Runs anywhere Python 3.8+ is available
+* On Linux, ignores pseudo/virtual mounts and scans each selected mount without crossing into other filesystems
 
 ---
 
